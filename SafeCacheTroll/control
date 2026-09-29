@@ -1,0 +1,8 @@
+Package: com.safecache.cleaner
+Name: SafeCache
+Version: 0.2.0
+Architecture: iphoneos-arm
+Description: Conservative cache cleaner for TrollStore. Only clears standard app cache directories selected by the user.
+Maintainer: local
+Author: local
+Section: Utilities
