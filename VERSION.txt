@@ -1,0 +1,3 @@
+SafeCache source version: 0.4.1
+Build generation: 41
+Expected artifact: SafeCache-v0.4.1-TrollStore

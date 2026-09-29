@@ -159,7 +159,9 @@
 
     self.scanner = [AppScanner new];
     self.cleaner = [CacheCleaner new];
-    self.settings = [SettingsStore new];
+    // Deliberately do not initialize SettingsStore during launch.
+    // First frame is pure UIKit; filesystem/user-default access begins only after a user action.
+    self.settings = nil;
     self.apps = @[];
 
     UIBarButtonItem *scan = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"arrow.clockwise"] style:UIBarButtonItemStylePlain target:self action:@selector(scanTapped)];
@@ -228,7 +230,7 @@
 
     self.tmpSwitch = [UISwitch new];
     self.tmpSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tmpSwitch.on = self.settings.includeTmp;
+    self.tmpSwitch.on = NO;
     [self.tmpSwitch addTarget:self action:@selector(tmpChanged:) forControlEvents:UIControlEventValueChanged];
 
     [scopeCard addSubview:folderIcon];
@@ -336,7 +338,16 @@
         [self.cleanButton.widthAnchor constraintGreaterThanOrEqualToConstant:112],
     ]];
 
-    [self scanTapped];
+    self.amountLabel.text = @"待扫描";
+    self.summaryLabel.text = @"已进入安全待机。启动阶段不扫描其他 App，也不读取白名单；点左上角扫描后才开始读取。";
+}
+
+- (SettingsStore *)ensureSettings {
+    if (!self.settings) {
+        self.settings = [SettingsStore new];
+        self.tmpSwitch.on = self.settings.includeTmp;
+    }
+    return self.settings;
 }
 
 - (NSString *)sizeText:(unsigned long long)bytes {
@@ -382,7 +393,7 @@
 }
 
 - (void)tmpChanged:(UISwitch *)sender {
-    self.settings.includeTmp = sender.isOn;
+    [self ensureSettings].includeTmp = sender.isOn;
     [self scanTapped];
 }
 
@@ -392,10 +403,32 @@
     self.amountLabel.text = @"扫描中…";
     self.summaryLabel.text = @"正在读取各 App 的标准缓存目录，不会修改文件。";
 
-    BOOL includeTmp = self.settings.includeTmp;
-    NSSet *wl = [self.settings whitelist].copy;
+    __block BOOL includeTmp = NO;
+    __block NSSet *wl = [NSSet set];
+    __block NSString *setupError = nil;
+    @try {
+        SettingsStore *settings = [self ensureSettings];
+        includeTmp = settings.includeTmp;
+        wl = [settings whitelist].copy ?: [NSSet set];
+    } @catch (NSException *exception) {
+        setupError = [NSString stringWithFormat:@"设置读取异常：%@", exception.reason ?: exception.name];
+    }
+
+    if (setupError.length > 0) {
+        self.amountLabel.text = @"未扫描";
+        self.summaryLabel.text = [setupError stringByAppendingString:@"。未访问其他 App，未执行任何删除。"];
+        [self setScanningState:NO];
+        return;
+    }
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSArray *items = [self.scanner scanAppsIncludeTmp:includeTmp whitelist:wl];
+        __block NSArray *items = @[];
+        __block NSString *scanError = nil;
+        @try {
+            items = [self.scanner scanAppsIncludeTmp:includeTmp whitelist:wl] ?: @[];
+        } @catch (NSException *exception) {
+            scanError = [NSString stringWithFormat:@"扫描异常：%@", exception.reason ?: exception.name];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             self.apps = items;
             unsigned long long total = 0;
@@ -407,7 +440,11 @@
                 }
             }
             self.amountLabel.text = [self sizeText:total];
-            self.summaryLabel.text = [NSString stringWithFormat:@"%lu 个 App 有可清理内容 · 白名单不会参与批量选择", (unsigned long)cleanable];
+            if (scanError.length > 0) {
+                self.summaryLabel.text = [NSString stringWithFormat:@"%@。未执行任何删除。", scanError];
+            } else {
+                self.summaryLabel.text = [NSString stringWithFormat:@"%lu 个 App 有可清理内容 · 白名单不会参与批量选择", (unsigned long)cleanable];
+            }
             [self.tableView reloadData];
             [self setScanningState:NO];
         });
@@ -427,9 +464,9 @@
         [self updateSelectionUI];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"把已选加入白名单" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        NSMutableSet *wl = [self.settings whitelist];
+        NSMutableSet *wl = [[self ensureSettings] whitelist];
         for (AppRecord *r in self.apps) if (r.selected) [wl addObject:r.bundleID];
-        [self.settings saveWhitelist:wl];
+        [[self ensureSettings] saveWhitelist:wl];
         for (AppRecord *r in self.apps) {
             r.whitelisted = [wl containsObject:r.bundleID];
             if (r.whitelisted) r.selected = NO;
@@ -447,7 +484,7 @@
     for (AppRecord *r in self.apps) if (r.selected && !r.whitelisted) [selected addObject:r];
     if (selected.count == 0) return;
 
-    NSString *scope = self.settings.includeTmp ? @"Library/Caches + tmp" : @"仅 Library/Caches";
+    NSString *scope = [self ensureSettings].includeTmp ? @"Library/Caches + tmp" : @"仅 Library/Caches";
     NSString *msg = [NSString stringWithFormat:@"将清理 %lu 个 App，扫描值约 %@。\n\n范围：%@\n\n不会删除 Documents、Application Support、数据库、偏好设置或白名单 App。建议先退出目标 App。", (unsigned long)selected.count, [self sizeText:[self selectedBytes]], scope];
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认安全清理" message:msg preferredStyle:UIAlertControllerStyleAlert];
     [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -460,7 +497,7 @@
 - (void)performClean:(NSArray<AppRecord *> *)selected {
     [self setScanningState:YES];
     self.summaryLabel.text = @"正在按安全路径规则逐项清理…";
-    BOOL includeTmp = self.settings.includeTmp;
+    BOOL includeTmp = [self ensureSettings].includeTmp;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __block unsigned long long freed = 0;
         NSMutableArray<NSString *> *logs = [NSMutableArray array];
@@ -503,7 +540,7 @@
     AppRecord *r = self.apps[indexPath.row];
 
     NSString *detail = nil;
-    if (self.settings.includeTmp) {
+    if ([self ensureSettings].includeTmp) {
         detail = [NSString stringWithFormat:@"缓存 %@ · tmp %@", [self sizeText:r.cacheBytes], [self sizeText:r.tmpBytes]];
     } else {
         detail = [NSString stringWithFormat:@"缓存 %@", [self sizeText:r.cacheBytes]];
@@ -548,9 +585,9 @@
 }
 
 - (void)toggleWhitelist:(AppRecord *)r {
-    NSMutableSet *wl = [self.settings whitelist];
+    NSMutableSet *wl = [[self ensureSettings] whitelist];
     if ([wl containsObject:r.bundleID]) [wl removeObject:r.bundleID]; else [wl addObject:r.bundleID];
-    [self.settings saveWhitelist:wl];
+    [[self ensureSettings] saveWhitelist:wl];
     r.whitelisted = [wl containsObject:r.bundleID];
     if (r.whitelisted) r.selected = NO;
     [self.tableView reloadData];
