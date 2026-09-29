@@ -1,0 +1,46 @@
+name: Build SafeCache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Static safety audit
+        run: ./scripts/static_audit.sh
+
+      - name: POSIX symlink safety test
+        run: |
+          clang -Wall -Wextra -Werror tests/posix_safety_test.c -o /tmp/safecache-safety-test
+          /tmp/safecache-safety-test
+
+      - name: Setup Theos
+        uses: waruhachi/theos-action@v2.6.3
+        with:
+          theos-src: 'theos/theos'
+          theos-branch: 'master'
+          sdks-src: 'theos/sdks'
+          sdks-branch: 'master'
+          remotelog: false
+          libgcuniversal: false
+          altlist: false
+          comet: false
+          orion: false
+
+      - name: Build TrollStore package
+        run: |
+          make clean
+          make stage FINALPACKAGE=1
+          test -f SafeCache.tipa
+
+      - name: Upload TIPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeCache-TrollStore
+          path: SafeCache.tipa
